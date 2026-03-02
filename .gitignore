@@ -1,0 +1,12 @@
+# Secretos y credenciales — NUNCA subir al repo
+.env
+credentials.json
+token.json
+
+# Entorno virtual
+venv/
+__pycache__/
+*.pyc
+
+# Logs del cron
+cron.log

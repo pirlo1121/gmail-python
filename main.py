@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Gmail Auto-Classifier
-Reads unread INBOX emails, classifies them via OpenAI GPT-4o-mini,
+Reads unread INBOX emails, classifies them via an LLM (DeepSeek by default,
+OpenAI optional; set LLM_PROVIDER=openai to switch),
 removes the INBOX label and applies the corresponding custom Gmail label.
 
 Designed to run every minute via cron on a low-RAM VPS (~360 MB).
@@ -43,14 +44,34 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
 TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    log.error("OPENAI_API_KEY not set. Add it to your .env file.")
+# Both providers expose an OpenAI-compatible API, so the same client works.
+PROVIDERS: dict[str, dict[str, str | None]] = {
+    "deepseek": {
+        "key_env": "DEEP_SEEK_KEY",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+    },
+    "openai": {
+        "key_env": "OPENAI_API_KEY",
+        "base_url": None,
+        "model": "gpt-4o-mini",
+    },
+}
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek").lower()
+if LLM_PROVIDER not in PROVIDERS:
+    log.error("Unknown LLM_PROVIDER '%s'. Use one of: %s", LLM_PROVIDER, ", ".join(PROVIDERS))
+    sys.exit(1)
+
+LLM_CONFIG = PROVIDERS[LLM_PROVIDER]
+LLM_API_KEY = os.getenv(LLM_CONFIG["key_env"])
+if not LLM_API_KEY:
+    log.error("%s not set. Add it to your .env file.", LLM_CONFIG["key_env"])
     sys.exit(1)
 
 BODY_MAX_CHARS = 1_500
-OPENAI_MODEL = "gpt-4o-mini"
-OPENAI_TIMEOUT = 20  # seconds – keep it tight for a cron job
+LLM_MODEL = os.getenv("LLM_MODEL", LLM_CONFIG["model"])
+LLM_TIMEOUT = 20  # seconds – keep it tight for a cron job
 
 # ---------------------------------------------------------------------------
 # Category → Gmail Label ID mapping
@@ -188,21 +209,21 @@ def apply_label(service, msg_id: str, label_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# OpenAI classification
+# LLM classification
 # ---------------------------------------------------------------------------
 def classify_email(client: OpenAI, subject: str, body: str) -> str:
-    """Call GPT-4o-mini and return exactly one category name."""
+    """Call the configured LLM and return exactly one category name."""
     user_content = f"Subject: {subject}\n\nBody:\n{body}"
     try:
         response = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             max_tokens=10,       # category name is at most 15 chars
             temperature=0,       # fully deterministic
-            timeout=OPENAI_TIMEOUT,
+            timeout=LLM_TIMEOUT,
         )
         category = response.choices[0].message.content.strip()
         # Safety fallback: if model hallucinates an unknown category
@@ -212,10 +233,10 @@ def classify_email(client: OpenAI, subject: str, body: str) -> str:
         return category
 
     except APITimeoutError:
-        log.warning("OpenAI timeout for message with subject '%s' – skipping", subject)
+        log.warning("LLM timeout for message with subject '%s' – skipping", subject)
         return "Uncategorized"
     except APIError as exc:
-        log.error("OpenAI API error: %s – skipping message", exc)
+        log.error("LLM API error: %s – skipping message", exc)
         return "Uncategorized"
 
 
@@ -226,7 +247,8 @@ def main() -> None:
     log.info("=== Gmail classifier started ===")
 
     service = get_gmail_service()
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_CONFIG["base_url"])
+    log.info("Using LLM provider '%s' (model: %s)", LLM_PROVIDER, LLM_MODEL)
 
     messages = get_inbox_messages(service)
     if not messages:
@@ -247,7 +269,7 @@ def main() -> None:
         subject = details["subject"]
         log.info("Processing: %s", subject)
 
-        category = classify_email(openai_client, subject, details["body"])
+        category = classify_email(llm_client, subject, details["body"])
         label_id = LABEL_MAP[category]
 
         success = apply_label(service, msg_id, label_id)
